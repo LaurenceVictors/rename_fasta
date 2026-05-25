@@ -75,6 +75,29 @@ CRITICAL SYNTAX RULES:
 """
 
 # ==========================================
+# CSV EDITOR PROMPT
+# ==========================================
+CSV_EDITOR_PROMPT = """
+Role: You are an expert Python Data Engineer.
+Objective: Generate Python code to modify a dictionary called 'lookup_map'.
+
+Context:
+- You have a dictionary named 'lookup_map'.
+- Keys = Old IDs (from CSV col 1).
+- Values = New IDs (from CSV col 2).
+
+Your Task:
+1. Receive a natural language request (e.g., "Lowercase the prefix before the first underscore in the values").
+2. Return ONLY valid Python code to iterate through 'lookup_map' and update the values.
+3. Do NOT use markdown. Do NOT use 'return'. Modify 'lookup_map' in place.
+
+Example Input: "Add 'prefix_' to all new IDs"
+Example Output:
+for key in lookup_map:
+    lookup_map[key] = "prefix_" + lookup_map[key]
+"""
+
+# ==========================================
 # 3. HELPER FUNCTIONS
 # ==========================================
 
@@ -196,6 +219,41 @@ def test_logic_safely(logic_code, sample_records, lookup_map=None):
 
     return pd.DataFrame(preview_data), error_msg
 
+def get_map_editor_logic(user_request, api_key):
+    """Calls LLM to generate code for modifying the CSV map."""
+    if not api_key: return None
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
+    messages = [
+        SystemMessage(content=CSV_EDITOR_PROMPT),
+        HumanMessage(content=f"User Request: {user_request}")
+    ]
+    response = llm.invoke(messages)
+    return response.content.replace("```python", "").replace("```", "").strip()
+
+def apply_map_logic(logic_code, current_map):
+    """Executes the generated code to modify the lookup_map."""
+    # Create a copy to avoid breaking the original if code fails
+    temp_map = current_map.copy()
+    
+    # Normalize and indent code
+    clean_logic = normalize_code_indentation(logic_code)
+    
+    # Wrap in a function to ensure scope safety
+    # We pass 'lookup_map' in, modify it, and it persists because dicts are mutable
+    full_code = f"""
+def map_modifier(lookup_map):
+    import re
+{textwrap.indent(clean_logic, '    ')}
+"""
+    scope = {}
+    try:
+        exec(full_code, scope)
+        modifier_func = scope['map_modifier']
+        modifier_func(temp_map) # Modifies temp_map in place
+        return temp_map, None
+    except Exception as e:
+        return current_map, f"Error executing map logic: {e}"
+
 # ==========================================
 # 4. STREAMLIT APP (THE BODY)
 # ==========================================
@@ -204,117 +262,144 @@ def main():
     st.set_page_config(page_title="Agentic FASTA Renamer", layout="wide")
     
     st.title("🧬 Agentic FASTA Renamer")
-    st.markdown("""
-    **Workflow:** Upload FASTA -> Describe renaming rules -> Agent writes code -> **Refine if needed** -> Download.
-    """)
+    st.markdown("**Workflow:** Upload -> **(Optional) Edit CSV** -> Rename FASTA -> Download.")
 
-    # --- Sidebar: Setup ---
+    # --- Sidebar ---
     with st.sidebar:
         st.header("Configuration")
         api_key = st.text_input("Google API Key", type="password")
-        
-        # Reset Button to clear state
         if st.button("Reset / Start Over"):
-            st.session_state.generated_code = None
+            st.session_state.clear()
             st.rerun()
 
-    # --- Step 1: File Uploads ---
-    uploaded_file = st.file_uploader("1. Upload FASTA File", type=["fasta", "fa"])
-    
-    # Optional CSV Map
-    csv_file = st.file_uploader("Optional: Upload CSV Map", type=["csv"])
-    lookup_map = {}
-    if csv_file:
+    # --- Session State Init ---
+    if "lookup_map" not in st.session_state:
+        st.session_state.lookup_map = {} # The active map
+    if "generated_code" not in st.session_state:
+        st.session_state.generated_code = None
+
+    # --- Step 1: Uploads ---
+    col_u1, col_u2 = st.columns(2)
+    with col_u1:
+        uploaded_file = st.file_uploader("1. Upload FASTA", type=["fasta", "fa"])
+    with col_u2:
+        csv_file = st.file_uploader("2. Upload CSV Map (Optional)", type=["csv"])
+
+    # Load CSV into Session State if uploaded and not yet loaded
+    if csv_file and not st.session_state.lookup_map:
         try:
             df = pd.read_csv(csv_file, header=None, dtype=str)
             if df.shape[1] >= 2:
-                lookup_map = dict(zip(df.iloc[:, 0].str.strip(), df.iloc[:, 1].str.strip()))
-                st.success(f"Loaded Mapping with {len(lookup_map)} entries.")
+                # Create dict: {Old_ID: New_ID}
+                raw_map = dict(zip(df.iloc[:, 0].str.strip(), df.iloc[:, 1].str.strip()))
+                st.session_state.lookup_map = raw_map
+                st.success(f"Loaded CSV with {len(raw_map)} entries.")
+            else:
+                st.error("CSV must have at least 2 columns.")
         except Exception as e:
             st.error(f"Error reading CSV: {e}")
 
+    # --- Step 2: CSV Editor (The New Feature) ---
+    if st.session_state.lookup_map:
+        with st.expander("🛠️ Optional: Edit CSV Map Logic", expanded=False):
+            st.info("Use this to modify your New IDs (Column 2) before applying them to the FASTA.")
+            
+            # Show Preview of Map
+            map_items = list(st.session_state.lookup_map.items())
+            preview_df = pd.DataFrame(map_items[:5], columns=["Old ID (Key)", "New ID (Value)"])
+            st.table(preview_df)
+            
+            # Convert the current dictionary back to a CSV string
+            csv_buffer = io.StringIO()
+            # We use header=False to match the input format (just data)
+            pd.DataFrame(map_items).to_csv(csv_buffer, index=False, header=False)
+            
+            st.download_button(
+                label="📥 Download Edited CSV",
+                data=csv_buffer.getvalue(),
+                file_name="edited_mapping.csv",
+                mime="text/csv",
+                help="Save the modified mapping file for later use."
+            )
+
+            csv_request = st.text_input(
+                "How should we modify the New IDs?", 
+                placeholder="Example: Lowercase the text before the first underscore."
+            )
+            
+            if st.button("Apply CSV Changes") and csv_request:
+                with st.spinner("Agent is updating the map..."):
+                    # 1. Get Code
+                    logic = get_map_editor_logic(csv_request, api_key)
+                    st.code(logic, language="python")
+                    
+                    # 2. Apply Code
+                    new_map, error = apply_map_logic(logic, st.session_state.lookup_map)
+                    
+                    if error:
+                        st.error(error)
+                    else:
+                        st.session_state.lookup_map = new_map
+                        st.success(f"Map updated! ({len(new_map)} entries)")
+                        st.rerun()
+
+    # --- Step 3: FASTA Renaming (Existing Logic) ---
     if uploaded_file:
+        st.divider()
+        st.subheader("3. FASTA Renaming Logic")
+        
+        # Load FASTA
         stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
         records = list(SeqIO.parse(stringio, "fasta"))
-        
-        # Initialize Session State
-        if "generated_code" not in st.session_state:
-            st.session_state.generated_code = None
 
-        # --- Step 2: Logic Generation (The Loop) ---
-        st.subheader("2. Renaming Logic")
-
-        # CASE A: No code generated yet (First Run)
+        # Logic Generation UI
         if st.session_state.generated_code is None:
             user_request = st.text_area(
                 "Describe renaming rules:", 
-                placeholder="Example: Use the CSV map. If not found, keep original ID.",
+                placeholder="Example: Use the map. Split FASTA ID at '/' to match map keys.",
                 height=100
             )
-            if st.button("Generate Initial Logic") and user_request:
+            if st.button("Generate Renaming Logic") and user_request:
                 with st.spinner("Agent is writing Python code..."):
-                    # Add context about map if it exists
                     req_context = user_request
-                    if lookup_map:
-                        req_context += f"\n(Context: lookup_map available with {len(lookup_map)} entries)"
+                    if st.session_state.lookup_map:
+                        req_context += f"\n(Context: lookup_map available with {len(st.session_state.lookup_map)} entries)"
                     
                     code = get_llm_logic(req_context, api_key)
                     st.session_state.generated_code = code
                     st.rerun()
 
-        # CASE B: Code exists (Refinement Phase)
         else:
+            # Refinement UI
             col1, col2 = st.columns([1, 1])
-            
             with col1:
                 st.markdown("### Current Logic")
                 st.code(st.session_state.generated_code, language="python")
                 
-                # --- THE REFINEMENT INPUT ---
-                st.markdown("#### 🛠️ Refine Logic")
-                refine_request = st.text_area(
-                    "Not perfect? Tell the agent what to fix:",
-                    placeholder="Example: 'Actually, make the ID uppercase' or 'Fix the error on line 3'"
-                )
-                
+                refine_request = st.text_area("Refine Logic:", placeholder="Tell the agent what to fix...")
                 if st.button("Update Logic"):
-                    with st.spinner("Agent is updating code..."):
+                    with st.spinner("Updating..."):
                         new_code = get_llm_logic(refine_request, api_key, current_code=st.session_state.generated_code)
                         st.session_state.generated_code = new_code
                         st.rerun()
 
             with col2:
                 st.markdown("### Preview")
-                # Run the dry run
-                preview_df, error = test_logic_safely(st.session_state.generated_code, records[:5], lookup_map)
+                # Pass the EDITED map to the test function
+                preview_df, error = test_logic_safely(st.session_state.generated_code, records[:5], st.session_state.lookup_map)
                 
                 if error:
                     st.error(error)
                 else:
                     st.dataframe(preview_df, use_container_width=True)
-                    if "ERROR" in preview_df['New ID'].values:
-                        st.warning("⚠️ Logic produced errors.")
-                    else:
-                        st.success("✅ Logic valid.")
 
-            # --- Step 3: Execution ---
+            # --- Step 4: Download ---
             st.divider()
-            st.subheader("3. Download Results")
-            
-            original_name = uploaded_file.name
-            new_filename = f"renamed_{original_name}" 
-            
-            # Construct script for download
-            full_script = BASE_TEMPLATE.format(
-                logic_code=st.session_state.generated_code,
-                lookup_map_repr=repr(lookup_map)
-            )
-            
             if st.button("Apply to All & Download"):
                 output_buffer = io.StringIO()
                 new_records = []
                 
-                # Robust Construction (from previous step)
+                # Robust Construction
                 clean_logic = normalize_code_indentation(st.session_state.generated_code)
                 indented_logic = textwrap.indent(clean_logic, '    ')
                 
@@ -325,7 +410,8 @@ def main():
                     "    return locals().get('new_id', original_id), locals().get('new_description', original_description)"
                 )
                 
-                execution_scope = {'lookup_map': lookup_map}
+                # Pass the EDITED map
+                execution_scope = {'lookup_map': st.session_state.lookup_map}
                 exec(full_function_str, execution_scope)
                 modifier_func = execution_scope['dynamic_modifier']
                 
@@ -341,12 +427,18 @@ def main():
 
                 SeqIO.write(new_records, output_buffer, "fasta")
                 
+                # Script Download (Injects the EDITED map)
+                full_script = BASE_TEMPLATE.format(
+                    logic_code=st.session_state.generated_code,
+                    lookup_map_repr=repr(st.session_state.lookup_map)
+                )
+
                 d_col1, d_col2 = st.columns(2)
                 with d_col1:
                     st.download_button(
-                        label=f"Download {new_filename}",
+                        label="Download FASTA",
                         data=output_buffer.getvalue(),
-                        file_name=new_filename,
+                        file_name=f"renamed_{uploaded_file.name}",
                         mime="text/plain"
                     )
                 with d_col2:
